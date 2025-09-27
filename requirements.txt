@@ -1,0 +1,13 @@
+# To install use 'pip install -r requirements.txt'
+
+torch==2.6
+torchvision==0.21
+torchaudio==2.6
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+transformers==4.51.3
+soundfile==0.13.1
+datasets==3.5.1
+evaluate==0.4.3
+--extra-index-url https://download.pytorch.org/whl/cu121

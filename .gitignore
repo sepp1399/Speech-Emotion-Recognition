@@ -1,0 +1,4 @@
+# add files that will not be uploaded in gitlab
+venv/
+output/
+input/
