@@ -72,6 +72,7 @@ python 01_transformer_training.py
 | 2.0.1   | Wav2Vec 2.0  | Switched to a Transformer-based model using Wav2Vec 2.0 for improved representation learning. |
 | 2.0.2   | WavLM        | Further improved performance by adopting WavLM, which offers better generalization for emotion recognition tasks. |
 | 2.1.0   | WavLM        | Development of a standardized framework for audio classification, integrating augmentation technique selection and hyperparameter optimization with Optuna. |
+| 2.1.1   | Whisper        | # Whisper is used as the feature extractor, representing the current state-of-the-art among transformer-based models for audio processing. |
 
 ---
 ✉️ **Authors**: Giuseppe Lentini

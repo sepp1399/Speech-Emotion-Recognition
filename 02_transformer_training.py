@@ -1,7 +1,7 @@
 """
 TITLE: "Speech Emotion Recognition (SER) using Transformers"
 AUTHORS: Giuseppe Lentini
-LAST UPDATE: 2025-06-26
+LAST UPDATE: 2025-07-11
 PYTHON VERSION: 3.11.11
 """
 
@@ -12,21 +12,27 @@ import torchaudio
 import pandas as pd
 import numpy as np
 import os
-from sklearn.model_selection import StratifiedGroupKFold
-from transformers import Wav2Vec2Processor,WavLMForSequenceClassification, TrainingArguments, Trainer
-from datasets import Dataset
-from transformers import DataCollatorWithPadding
-from joblib import Parallel, delayed
-from tqdm import tqdm
 import gc
 import random
+import evaluate
+from sklearn.model_selection import StratifiedGroupKFold
+from transformers import (
+    TrainingArguments,
+    Trainer,
+    TrainerCallback,
+    WhisperConfig,
+    WhisperForAudioClassification,
+    WhisperFeatureExtractor,
+    DefaultDataCollator
+)
+from datasets import Dataset
+from tqdm import tqdm
+from joblib import Parallel, delayed
+from sklearn.metrics import recall_score, accuracy_score, f1_score
+import warnings 
 import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
-from sklearn.metrics import recall_score, accuracy_score, f1_score
-from transformers import EarlyStoppingCallback
-from transformers.trainer_callback import TrainerCallback
-import warnings
 
 warnings.filterwarnings("ignore")
 
@@ -59,13 +65,12 @@ TECHNIQUES_CSV_PATH = "output/best_techniques.csv"
 NUMBER_SPLIT_ROUNDS = 3000
 
 # Main parameters
-MODEL_NAME = "jonatasgrosman/exp_w2v2t_it_wavlm_s895"
-NUM_LABELS = 7
+MODEL_NAME = "openai/whisper-small"
 BATCH_SIZE = 32
 EPOCHS = 13
 LEARNING_RATE = 3e-5
-MAX_DURATION = 4  # in seconds
-
+label_mapping = {'Anger': 0, 'Disgust': 1, 'Fear': 2, 'Joy': 3, 'Neutral': 4, 'Sadness': 5, 'Surprise': 6}
+NUM_LABELS = len(label_mapping)
 ###############################################################################
 ## METHODS
 
@@ -137,42 +142,25 @@ def get_best_split(df_data, max_attempts=1000, seed=42, n_jobs=6):
     return best_splits  # Return the most balanced split
 
 def preprocess_function(batch):
-    """
-    Preprocesses a batch of audio files for model input, compatible with datasets.map(batched=True).
-    Returns numpy arrays instead of tensors.
-    """
-    max_length = MAX_DURATION * 16000  # lunghezza fissa
     audio_arrays = []
 
     for path in batch["path"]:
+
         waveform, sample_rate = torchaudio.load(path)
 
-        # Mono
         if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-        # Resample a 16kHz
         if sample_rate != 16000:
             resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
             waveform = resampler(waveform)
 
-        # Padding o truncation
-        if waveform.shape[1] > max_length:
-            waveform = waveform[:, :max_length]
-        else:
-            padding = max_length - waveform.shape[1]
-            waveform = torch.nn.functional.pad(waveform, (0, padding))
+        audio_arrays.append(waveform.squeeze().numpy())
 
-        audio_arrays.append(waveform.squeeze(0).numpy())  # torna su CPU e numpy
-
-    # Tokenization
-    inputs = processor(audio_arrays, sampling_rate=16000, return_tensors="pt", padding=True)
-
-    return {
-        "input_values": inputs["input_values"],
-        "attention_mask": inputs.get("attention_mask"),
-        "labels": np.array(batch["label"])
-    }
+    inputs = feature_extractor(audio_arrays, sampling_rate=16000)
+    batch["input_features"] = inputs["input_features"]
+    batch["labels"] = batch["label"]
+    return batch
 
 def compute_metrics(eval_pred):
     """
@@ -241,18 +229,22 @@ def objective(trial, train_dataset, val_dataset):
     
     # Hyperparameters to optimize
     learning_rate = trial.suggest_float("learning_rate", 1e-5, 3e-4, log=True)
-    classifier_proj_size = trial.suggest_categorical("classifier_proj_size", [256, 512])
-    hidden_dropout = trial.suggest_float("hidden_dropout", 0.05, 0.2)
-    attention_dropout = trial.suggest_float("attention_dropout", 0.05, 0.2)
     weight_decay = trial.suggest_float("weight_decay", 0.01, 0.05)
 
+    config = WhisperConfig.from_pretrained(MODEL_NAME)
+    config.num_labels = NUM_LABELS
+    config.label2id = label_mapping
+    config.id2label = {v: k for k, v in label_mapping.items()}
+
+    config.max_length = None
+    config.suppress_tokens = None
+    config.begin_suppress_tokens = None
+
     # Load and configure the model with the suggested hyperparameters
-    model = WavLMForSequenceClassification.from_pretrained(
+    model = WhisperForAudioClassification.from_pretrained(
         MODEL_NAME,
-        num_labels=NUM_LABELS,
-        attention_dropout=attention_dropout,
-        hidden_dropout=hidden_dropout,
-        classifier_proj_size=classifier_proj_size,
+        config=config,
+        ignore_mismatched_sizes=True
     ).to(device)
 
     # Define dynamic training arguments based on trial suggestions
@@ -323,80 +315,82 @@ else:
     df_additional_test.to_parquet(PROCESSED_TEST_PATH)
 
 ###############################################################################
-## HYPERPARAMETERS TUNING 
-processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+# ## HYPERPARAMETERS TUNING 
+# processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
 
-data_collator = DataCollatorWithPadding(processor)
+# data_collator = DataCollatorWithPadding(processor)
 
-if(os.path.exists('output/optuna_trial/best_params.csv')):
-    best_params_df = pd.read_csv('output/optuna_trial/best_params.csv')
-else:
-    # Get a well-balanced train/validation split
-    train_df, val_df, _ = get_best_split(df_data, NUMBER_SPLIT_ROUNDS, SEED)
-    train_dataset = Dataset.from_pandas(train_df).map(preprocess_function, batched=True)
-    val_dataset = Dataset.from_pandas(val_df).map(preprocess_function, batched=True)
+# if(os.path.exists('output/optuna_trial/best_params.csv')):
+#     best_params_df = pd.read_csv('output/optuna_trial/best_params.csv')
+# else:
+#     # Get a well-balanced train/validation split
+#     train_df, val_df, _ = get_best_split(df_data, NUMBER_SPLIT_ROUNDS, SEED)
+#     train_dataset = Dataset.from_pandas(train_df).map(preprocess_function, batched=True)
+#     val_dataset = Dataset.from_pandas(val_df).map(preprocess_function, batched=True)
     
-    print("\n|START HYPERPARAMETER TUNING|")
+#     print("\n|START HYPERPARAMETER TUNING|")
     
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=TPESampler(seed=SEED),
-        pruner=MedianPruner(
-            n_startup_trials=3,
-            n_warmup_steps=2,
-            interval_steps=1
-        )
-    )
-    study.optimize(lambda trial: objective(trial, train_dataset, val_dataset), n_trials=60, show_progress_bar=True)
-    best_params = study.best_params
-    best_params_df = pd.DataFrame([study.best_params])
-    best_params_df["best_value"] = study.best_value  
-    best_params_df.to_csv("output/optuna_trial/best_params.csv", index=False)
+#     study = optuna.create_study(
+#         direction="maximize",
+#         sampler=TPESampler(seed=SEED),
+#         pruner=MedianPruner(
+#             n_startup_trials=3,
+#             n_warmup_steps=2,
+#             interval_steps=1
+#         )
+#     )
+#     study.optimize(lambda trial: objective(trial, train_dataset, val_dataset), n_trials=60, show_progress_bar=True)
+#     best_params = study.best_params
+#     best_params_df = pd.DataFrame([study.best_params])
+#     best_params_df["best_value"] = study.best_value  
+#     best_params_df.to_csv("output/optuna_trial/best_params.csv", index=False)
 
 ###############################################################################
 ## START ITERATIVE TRAINING
 
-additional_test_dataset = Dataset.from_pandas(df_additional_test)
-additional_test_dataset = additional_test_dataset.map(preprocess_function, batched=True)
+feature_extractor = WhisperFeatureExtractor.from_pretrained(MODEL_NAME)
+metric = evaluate.load("accuracy")
+data_collator = DefaultDataCollator(return_tensors="pt")
 
 training_args = TrainingArguments(
-    output_dir="./ser_model",
-
-    # Evaluation & Saving
-    eval_strategy="epoch",  # Evaluate at each epoch
-    save_strategy="epoch",  # Save the model at each epoch
-    save_total_limit=2,  # Keep only the 2 best checkpoints
+    output_dir="./whisper/ser_model",
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    save_total_limit=2,
     load_best_model_at_end=True,
     metric_for_best_model="uar",
+    greater_is_better=True,
 
-    # Optimization
-    learning_rate=best_params["learning_rate"],
-    lr_scheduler_type="cosine",  # Cosine decay for smoother training
-    weight_decay=best_params["weight_decay"],
-    warmup_ratio=0.1,  # 10% of steps for warm-up
+    learning_rate=LEARNING_RATE,
+    lr_scheduler_type="cosine_with_restarts",
+    warmup_ratio=0.1,
+    weight_decay=0.05,
     adam_beta1=0.9,
     adam_beta2=0.98,
     adam_epsilon=1e-8,
 
-    # Batch Size & Epochs
-    per_device_train_batch_size=BATCH_SIZE,  # Adjust based on GPU memory
+    per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=2,  # If batch size is too large for GPU
-    num_train_epochs=EPOCHS,  # More epochs improve generalization in SER
+    gradient_accumulation_steps=1,
 
-    # Logging & Monitoring
+    num_train_epochs=EPOCHS,
     logging_dir="./logs",
-    logging_steps=50,  # Log every 50 steps
+    logging_steps=50,
 
-    # Performance Boost
-    fp16=True,  # Mixed Precision for faster training
-    gradient_checkpointing=True,  # Reduce memory usage
-    dataloader_num_workers=4,  # Speed up data loading
-    optim="adamw_torch",  # Advanced optimizer
+    fp16=True,
+    gradient_checkpointing=True,
 
-    # Distributed Training
-    ddp_find_unused_parameters=False,  # Optimized for DDP
+    dataloader_num_workers=16,
+    optim="adamw_torch",
+    ddp_find_unused_parameters=False,
+
+    max_grad_norm=1.0,
+    label_smoothing_factor=0.05,
 )
+
+
+additional_test_dataset = Dataset.from_pandas(df_additional_test)
+additional_test_dataset = additional_test_dataset.map(preprocess_function, batched=True)
 
 for i in range(15):
     print(f"Starting training MODEL_{i}")
@@ -405,13 +399,20 @@ for i in range(15):
     os.makedirs(folder_path, exist_ok=True)
 
     # Load a new model on GPU
-    model = WavLMForSequenceClassification.from_pretrained(
+    config = WhisperConfig.from_pretrained(MODEL_NAME)
+    config.num_labels = NUM_LABELS
+    config.label2id = label_mapping
+    config.id2label = {v: k for k, v in label_mapping.items()}
+
+    config.max_length = None
+    config.suppress_tokens = None
+    config.begin_suppress_tokens = None
+
+    model = WhisperForAudioClassification.from_pretrained(
         MODEL_NAME,
-        num_labels=NUM_LABELS,
-        attention_dropout=best_params["attention_dropout"],
-        hidden_dropout=best_params["hidden_dropout"],
-        classifier_proj_size=best_params["classifier_proj_size"],
-    ).to(device)  # Move model to GPU
+        config=config,
+        ignore_mismatched_sizes=True
+    ).to(device)
 
     # Dataset
     train_df, val_df, test_df = get_best_split(df_data, NUMBER_SPLIT_ROUNDS, i)
@@ -435,7 +436,6 @@ for i in range(15):
         eval_dataset=val_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
 
     # clean memory before training
@@ -444,12 +444,12 @@ for i in range(15):
 
     trainer.train()
 
-    trainer.save_model(f"./output/MODEL_{i}/ser_finetuned_model")
-    processor.save_pretrained(f"./output/MODEL_{i}/ser_finetuned_model")
+    trainer.save_model(f"{folder_path}/ser_finetuned_model")
+    feature_extractor.save_pretrained(f"{folder_path}/ser_finetuned_model")
 
     metrics = trainer.evaluate()
-    output_file = f"./output/MODEL_{i}/training_metrics.txt"
-    
+    output_file = f"{folder_path}/training_metrics.txt"
+
     with open(output_file, "w") as f:
         for key, value in metrics.items():
             f.write(f"{key}: {value}\n")

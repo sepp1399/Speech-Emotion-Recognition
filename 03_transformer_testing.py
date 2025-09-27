@@ -14,13 +14,12 @@ import librosa
 import torch
 import torch.nn.functional as F
 import onnxruntime as ort
-from transformers import Wav2Vec2Processor
 from tqdm import tqdm
 from sklearn.metrics import confusion_matrix, accuracy_score, classification_report, matthews_corrcoef, recall_score, f1_score
 import seaborn as sns
 import matplotlib.pyplot as plt
 import argparse
-from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
+from transformers import WhisperProcessor, WhisperForAudioClassification
 
 ###############################################################################
 ## SET PARAMETERS
@@ -30,10 +29,10 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Parameters
 SAMPLING_RATE = 16000
-datasets = ['CaFE', 'RAVDESS', 'EMOVO', 'CREMA-D', 'emoDB', 'Multilinguis']
-MAX_DURATION = 4
+datasets = ['EMOVO', 'Multilinguis']
+MAX_DURATION = 30
 max_length = MAX_DURATION * SAMPLING_RATE
-label_mapping = {0: 'Anger', 1: 'Disgust', 2: 'Fear', 3: 'Joy', 4: 'Neutral', 5: 'Sadness', 6: 'Surprise'}
+label_mapping = {'Anger': 0, 'Disgust': 1, 'Fear': 2, 'Joy': 3, 'Neutral': 4, 'Sadness': 5, 'Surprise': 6}
 BATCH_SIZE = 32  # Define batch size
 
 # Create folder for results
@@ -62,7 +61,7 @@ def predict_emotion_batch(audio_paths, ort_session, processor):
     
     # Prepare inputs for the ONNX model
     inputs = processor(audio_arrays, sampling_rate=SAMPLING_RATE, return_tensors="pt", padding=True)
-    input_values = inputs['input_values'].cpu().numpy()
+    input_values = inputs['input_features'].cpu().numpy()
 
     # Prepare input for the ONNX model
     ort_inputs = {ort_session.get_inputs()[0].name: input_values}
@@ -103,11 +102,11 @@ def predict_emotion(audio_path, model, processor):
 
 if MODE == 'production':
     # Load the optimized ONNX model
-    onnx_model_path = "production_model/ser_model_optimized.onnx"
+    onnx_model_path = "production_model/ser_model_consolidated.onnx"
     ort_session = ort.InferenceSession(onnx_model_path, providers=["CUDAExecutionProvider"])
 
     # Load the processor
-    processor = Wav2Vec2Processor.from_pretrained("MODEL/ser_finetuned_model")
+    processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
 
 ###############################################################################
 ## START ANALYSIS
@@ -121,16 +120,16 @@ else:
 
     
 if MODE == 'testing':
-    num_iterations = 15
-else:
     num_iterations = 1
+else:
+    num_iterations = 15
 
 for i in range(num_iterations):
 
     if MODE == 'testing':
-            MODEL_NAME = f"output/MODEL_{i}/ser_finetuned_model"
-            model = Wav2Vec2ForSequenceClassification.from_pretrained(MODEL_NAME).to(device)
-            processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+            MODEL_NAME = f"whisper/output/MODEL_{i}/ser_finetuned_model"
+            model = WhisperForAudioClassification.from_pretrained(MODEL_NAME).to(device)
+            processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
     
     dataset_map = {}
 
